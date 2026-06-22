@@ -40,6 +40,8 @@ static class Program {
         foreach (var b in basePrefixes)
             Console.WriteLine(b);
         Console.WriteLine();
+        Console.WriteLine($"当前目录：{Environment.CurrentDirectory}");
+        Console.WriteLine();
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (s, e) => {
             e.Cancel = true;
