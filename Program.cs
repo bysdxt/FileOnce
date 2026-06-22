@@ -71,7 +71,7 @@ static class Program {
 
     static async Task RunOneCycle(string[] basePrefixes, CancellationToken ct, Task ct_task) {
         string token = GenerateToken();
-        Console.WriteLine($"\n--- 新令牌: `{token}` ---");
+        Console.WriteLine($"\n--- Token: `{token}` ---");
 
         var listener = new HttpListener();
         try {
