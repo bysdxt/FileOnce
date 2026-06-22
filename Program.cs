@@ -15,6 +15,7 @@ static class Program {
     static readonly byte[] FileBuffer = new byte[MaxFileSize + 16];
     static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
     static volatile bool wrote = false;
+    static string root = ".";
 
     static readonly HashSet<string> ReservedFileNames = new(StringComparer.OrdinalIgnoreCase) {
         "CON", "PRN", "AUX", "NUL",
@@ -40,7 +41,7 @@ static class Program {
         foreach (var b in basePrefixes)
             Console.WriteLine(b);
         Console.WriteLine();
-        Console.WriteLine($"当前目录：{Environment.CurrentDirectory}");
+        Console.WriteLine($"当前目录：{root = Environment.CurrentDirectory}");
         Console.WriteLine();
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (s, e) => {
@@ -167,7 +168,7 @@ static class Program {
     }
 
     static async Task HandleGetAsync(string fileName, HttpListenerResponse response, CancellationToken ct) {
-        string filePath = Path.Combine(Environment.CurrentDirectory, fileName);
+        string filePath = Path.Combine(root, fileName);
         if (!File.Exists(filePath)) {
             WriteTextResponse(response, 400, $"文件不存在: {fileName}");
             return;
@@ -234,7 +235,7 @@ static class Program {
         }
 
         // 校验通过，写入磁盘
-        string filePath = Path.Combine(Environment.CurrentDirectory, fileName);
+        string filePath = Path.Combine(root, fileName);
         using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None)) {
             await fs.WriteAsync(FileBuffer, 0, totalRead, ct);
         }
