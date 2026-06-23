@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using System.Diagnostics;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,6 +17,7 @@ static class Program {
     static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
     static volatile bool wrote = false;
     static string root = ".";
+    static long start_time = 0, data_amount = 0;
 
     static readonly HashSet<string> ReservedFileNames = new(StringComparer.OrdinalIgnoreCase) {
         "CON", "PRN", "AUX", "NUL",
@@ -31,6 +33,7 @@ static class Program {
     }
 
     static async Task Main(string[] args) {
+        Console.WriteLine();
         if (args.Length == 0) {
             Console.WriteLine("用法: FileOnce <http前缀1> [http前缀2] ...");
             Console.WriteLine("示例: FileOnce http://127.0.0.1:6543/fileonce/ http://8.9.10.11:80/outside/");
@@ -51,6 +54,29 @@ static class Program {
         };
         var ct = cts.Token;
         var ct_task = Task.Delay(-1, ct);
+        try {
+            Console.Title = nameof(FileOnce);
+            (new Thread(() => {
+                long t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+                long a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                while (!ct.WaitHandle.WaitOne(499)) {
+                    var t = Interlocked.Read(ref start_time);
+                    var a = Interlocked.Read(ref data_amount);
+                    if (t <= 0) {
+                        t1 = t2 = t3 = a1 = a2 = a3 = 0;
+                        continue;
+                    }
+                    t0 = t1; a0 = a1;
+                    t1 = t2; a1 = a2;
+                    t2 = t3; a2 = a3;
+                    t3 = t; a3 = a;
+                    Console.Title = $"平均速度 = {StrSpeed(a3, t3)} ； 即时速度 = {StrSpeed(a3 - a0, t3 - t0)}";
+                }
+            })).Start();
+        } catch (Exception ex) {
+            Console.WriteLine(ex.Message);
+            Console.WriteLine();
+        }
         while (!ct.IsCancellationRequested) {
             try {
                 await RunOneCycle(basePrefixes, ct, ct_task);
@@ -63,13 +89,23 @@ static class Program {
                 return;
             } catch (Exception ex) {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"意外错误: {ex.Message}");
+                Console.WriteLine($"意外错误`{ex.GetType()}`: {ex.Message}");
                 Console.ResetColor();
                 return;
             }
         }
     }
-
+    static string StrBytes(decimal bytes) {
+        if (bytes <= 1m) return $"{bytes} byte";
+        if (bytes <= 1024m) return $"{bytes} bytes";
+        if (bytes <= 1048576m) return $"{bytes / 1024m:F2} KiB";
+        if (bytes <= 1073741824m) return $"{bytes / 1048576m:F2} MiB";
+        return $"{bytes / 1073741824m:F2} GiB";
+    }
+    static string StrSpeed(long a, long t) {
+        if (t < 1) return "??? ??";
+        return $"{StrBytes(decimal.Divide(a, decimal.Divide(t, Stopwatch.Frequency)))}/s";
+    }
     static async Task RunOneCycle(string[] basePrefixes, CancellationToken ct, Task ct_task) {
         string token = GenerateToken();
         Console.WriteLine($"\n--- Token: `{token}` ---");
@@ -97,8 +133,11 @@ static class Program {
                 }
             } while (await ProcessRequestAsync(context, ct));
         } finally {
-            ct_task.Wait(997);
+            Interlocked.Exchange(ref start_time, 0);
+            Interlocked.Exchange(ref data_amount, 0);
+            ct.WaitHandle.WaitOne(997);
             try { listener.Close(); } catch { }
+            ct.WaitHandle.WaitOne(997);
         }
     }
 
@@ -195,7 +234,7 @@ static class Program {
         await response.OutputStream.WriteAsync(FileBuffer, 0, fileLength, ct);
         response.Close();
 
-        Console.WriteLine($"[GET] {fileName} Blake3={hash}");
+        Console.WriteLine($"[GET]\t{fileName}\tBlake3={hash}");
     }
 
     static async Task HandlePostAsync(string fileName, HttpListenerRequest request, HttpListenerResponse response, CancellationToken ct) {
@@ -211,7 +250,9 @@ static class Program {
             WriteTextResponse(response, 400, $"请求体过大，最大允许 {MaxFileSize} 字节");
             return;
         }
-
+        long st = Stopwatch.GetTimestamp();
+        Interlocked.Exchange(ref start_time, 0);
+        Interlocked.Exchange(ref data_amount, 0);
         // 将请求体读入共享缓冲区
         var requestStream = request.InputStream;
         int totalRead = 0;
@@ -222,7 +263,11 @@ static class Program {
                 WriteTextResponse(response, 400, $"请求体超出最大允许大小 {MaxFileSize} 字节");
                 return;
             }
+            Interlocked.Exchange(ref start_time, Stopwatch.GetTimestamp() - st);
+            Interlocked.Exchange(ref data_amount, totalRead);
         }
+        Interlocked.Exchange(ref start_time, Stopwatch.GetTimestamp() - st);
+        Interlocked.Exchange(ref data_amount, totalRead);
 
         // 计算实际哈希
         Hash actualHash = Hasher.Hash(FileBuffer.AsSpan(0, totalRead));
@@ -242,7 +287,7 @@ static class Program {
 
         WriteTextResponse(response, 200, "OK");
 
-        Console.WriteLine($"[POST] {fileName} Blake3={blake3Header}");
+        Console.WriteLine($"[POST]\t{fileName}\tBlake3={blake3Header}");
     }
 
     static void WriteTextResponse(HttpListenerResponse response, int httpcode, string message) {
