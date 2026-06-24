@@ -11,7 +11,7 @@
 		<Nullable>enable</Nullable>
 		<DebugType>embedded</DebugType>
 		<ErrorReport>send</ErrorReport>
-		<LangVersion>latest</LangVersion>
+		<LangVersion>preview</LangVersion>
 		<AssemblyName>$(MSBuildProjectName).$(TargetFramework)</AssemblyName>
 		<DebugSymbols>true</DebugSymbols>
 		<Deterministic>false</Deterministic>
