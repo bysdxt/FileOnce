@@ -1,8 +1,10 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+
 
 using Blake3;
 
@@ -14,10 +16,15 @@ static class Program {
     static ReadOnlySpan<char> TokenChars() => "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789";
     const long MaxFileSize = 128 * 1024 * 1024; // 128 MB
     static readonly byte[] FileBuffer = new byte[MaxFileSize + 16];
+    static readonly byte[] AES_Buffer = new byte[MaxFileSize];
     static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
     static volatile bool wrote = false;
     static string root = ".";
     static long start_time = 0, data_amount = 0;
+    const byte bytes_aes_key = 32;
+    const byte bytes_aes_nonce = 12;
+    const byte bytes_aes_tag = 16;
+    static readonly byte[] aes_key_nonce_tag = new byte[bytes_aes_key + bytes_aes_nonce + bytes_aes_tag];
 
     static readonly HashSet<string> ReservedFileNames = new(StringComparer.OrdinalIgnoreCase) {
         "CON", "PRN", "AUX", "NUL",
@@ -109,13 +116,14 @@ static class Program {
     static async Task RunOneCycle(string[] basePrefixes, CancellationToken ct, Task ct_task) {
         string token = GenerateToken();
         Console.WriteLine($"\n--- Token: `{token}` ---");
-
+        Console.WriteLine($"--- AesKeyNonce: `{Convert.ToHexString(aes_key_nonce_tag, 0, bytes_aes_key + bytes_aes_nonce)}` ---");
+        using AesGcm aes = new(new ReadOnlySpan<byte>(aes_key_nonce_tag, 0, bytes_aes_key), bytes_aes_tag);
         var listener = new HttpListener();
         try {
             foreach (var bp in basePrefixes) {
                 string full = bp + token + "/";
                 listener.Prefixes.Add(full);
-                Console.WriteLine(full);
+                //Console.WriteLine(full);
             }
 
             listener.Start();
@@ -131,7 +139,7 @@ static class Program {
                 } catch (ObjectDisposedException) when (ct.IsCancellationRequested) {
                     throw new OperationCanceledException(ct);
                 }
-            } while (await ProcessRequestAsync(context, ct));
+            } while (await ProcessRequestAsync(aes, context, ct));
         } finally {
             Interlocked.Exchange(ref start_time, 0);
             Interlocked.Exchange(ref data_amount, 0);
@@ -141,7 +149,7 @@ static class Program {
         }
     }
 
-    static async Task<bool> ProcessRequestAsync(HttpListenerContext context, CancellationToken ct) {
+    static async Task<bool> ProcessRequestAsync(AesGcm aes, HttpListenerContext context, CancellationToken ct) {
         wrote = false;
         var request = context.Request;
         var response = context.Response;
@@ -150,7 +158,7 @@ static class Program {
             response.AddHeader("Access-Control-Allow-Methods", "GET, POST");
             response.AddHeader("Access-Control-Allow-Headers", "*");
             response.AddHeader("Access-Control-Allow-Private-Network", "true");
-            response.AddHeader("Access-Control-Expose-Headers", "Blake3");
+            response.AddHeader("Access-Control-Expose-Headers", "Blake3, Aes-Tag");
             response.AddHeader("Access-Control-Max-Age", "999");
             response.AddHeader("Cache-Control", "no-store, no-cache");
             response.AddHeader("Pragma", "no-cache");
@@ -183,10 +191,10 @@ static class Program {
             try {
                 switch (method) {
                     case "GET":
-                    await HandleGetAsync(fileName, response, ct);
+                    await HandleGetAsync(aes, fileName, response, ct);
                     return false;
                     case "POST":
-                    await HandlePostAsync(fileName, request, response, ct);
+                    await HandlePostAsync(aes, fileName, request, response, ct);
                     return false;
                     case "OPTIONS":
                     WriteTextResponse(response, 200, "");
@@ -206,7 +214,7 @@ static class Program {
         return false;
     }
 
-    static async Task HandleGetAsync(string fileName, HttpListenerResponse response, CancellationToken ct) {
+    static async Task HandleGetAsync(AesGcm aes, string fileName, HttpListenerResponse response, CancellationToken ct) {
         string filePath = Path.Combine(root, fileName);
         if (!File.Exists(filePath)) {
             WriteTextResponse(response, 400, $"文件不存在: {fileName}");
@@ -224,26 +232,38 @@ static class Program {
             await fs.ReadAsync(FileBuffer, 0, fileLength, ct);
         }
 
-        Hash hash = Hasher.Hash(FileBuffer.AsSpan(0, fileLength));
+        Hash hash = Hasher.Hash(new ReadOnlySpan<byte>(FileBuffer, 0, fileLength));
+        Span<byte> aes_data = new(aes_key_nonce_tag);
+        var aes_tag = aes_data.Slice(bytes_aes_key + bytes_aes_nonce, bytes_aes_tag);
+        aes.Encrypt(aes_data.Slice(bytes_aes_key, bytes_aes_nonce), new ReadOnlySpan<byte>(FileBuffer, 0, fileLength), new Span<byte>(AES_Buffer, 0, fileLength), aes_tag);
 
         response.StatusCode = 200;
         response.ContentType = "application/octet-stream";
         response.ContentLength64 = fileLength;
-        response.Headers.Add("Blake3", hash.ToString());
+        response.AddHeader("Blake3", hash.ToString());
+        response.AddHeader("Aes-Tag", Convert.ToHexString(aes_tag));
 
-        await response.OutputStream.WriteAsync(FileBuffer, 0, fileLength, ct);
+        await response.OutputStream.WriteAsync(AES_Buffer, 0, fileLength, ct);
         response.Close();
 
         Console.WriteLine($"[GET]\t{fileName}\tBlake3={hash}");
     }
 
-    static async Task HandlePostAsync(string fileName, HttpListenerRequest request, HttpListenerResponse response, CancellationToken ct) {
+    static async Task HandlePostAsync(AesGcm aes, string fileName, HttpListenerRequest request, HttpListenerResponse response, CancellationToken ct) {
         // 检查 Blake3 请求头
         string? blake3Header = request.Headers["Blake3"];
         if (string.IsNullOrWhiteSpace(blake3Header)) {
             WriteTextResponse(response, 400, "请求缺少 Blake3 头");
             return;
         }
+
+        string? AesTag = request.Headers["Aes-Tag"];
+        if (string.IsNullOrWhiteSpace(AesTag)) {
+            WriteTextResponse(response, 400, "请求缺少 Aes-Tag 头");
+            return;
+        }
+
+        new ReadOnlySpan<byte>(Convert.FromHexString(AesTag)).CopyTo(new Span<byte>(aes_key_nonce_tag, bytes_aes_key + bytes_aes_nonce, bytes_aes_tag));
 
         // Content-Length 预检
         if (request.ContentLength64 > MaxFileSize) {
@@ -269,8 +289,12 @@ static class Program {
         Interlocked.Exchange(ref start_time, Stopwatch.GetTimestamp() - st);
         Interlocked.Exchange(ref data_amount, totalRead);
 
+        Span<byte> aes_data = new(aes_key_nonce_tag);
+        var aes_tag = aes_data.Slice(bytes_aes_key + bytes_aes_nonce, bytes_aes_tag);
+        aes.Decrypt(aes_data.Slice(bytes_aes_key, bytes_aes_nonce), new ReadOnlySpan<byte>(FileBuffer, 0, totalRead), aes_tag, new Span<byte>(AES_Buffer, 0, totalRead));
+
         // 计算实际哈希
-        Hash actualHash = Hasher.Hash(FileBuffer.AsSpan(0, totalRead));
+        Hash actualHash = Hasher.Hash(new ReadOnlySpan<byte>(AES_Buffer, 0, totalRead));
         string actualHex = actualHash.ToString(); // 小写十六进制
 
         // 与请求头中的值进行不区分大小写的比较
@@ -282,7 +306,7 @@ static class Program {
         // 校验通过，写入磁盘
         string filePath = Path.Combine(root, fileName);
         using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None)) {
-            await fs.WriteAsync(FileBuffer, 0, totalRead, ct);
+            await fs.WriteAsync(AES_Buffer, 0, totalRead, ct);
         }
 
         WriteTextResponse(response, 200, "OK");
@@ -300,6 +324,7 @@ static class Program {
     }
 
     static string GenerateToken() {
+        RandomNumberGenerator.Fill(aes_key_nonce_tag);
         var Tokens = TokenChars();
         var nToken = unchecked((uint)Tokens.Length);
         var pTokenIndexes = TokenIndexes.AsSpan();
